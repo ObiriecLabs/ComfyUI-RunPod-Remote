@@ -1,0 +1,6 @@
+# Dati runtime (possono contenere API key / dati endpoint)
+config.json
+manifest_cache.json
+__pycache__/
+*.pyc
+.DS_Store
