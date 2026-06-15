@@ -33,7 +33,7 @@ from .runpod_client import submit_job, get_status, cancel_job
 CONFIG_PATH = Path(__file__).parent / "config.json"
 DEFAULT_CONFIG = {
     "api_key": "",
-    "endpoint_id": "a007azjm8d8r4k",
+    "endpoint_id": "",
 }
 
 
