@@ -34,6 +34,7 @@ CONFIG_PATH = Path(__file__).parent / "config.json"
 DEFAULT_CONFIG = {
     "api_key": "",
     "endpoint_id": "",
+    "companion_url": "",
 }
 
 
@@ -48,6 +49,30 @@ def _load_config() -> dict:
 
 def _save_config(cfg: dict) -> None:
     CONFIG_PATH.write_text(json.dumps(cfg, indent=2))
+
+
+def _proxy_companion(path: str, body: bytes = b"", method: str = "POST") -> tuple:
+    """Forward request to companion app. URL set via companion_url in config.json."""
+    import urllib.request as ureq
+    base = _load_config().get("companion_url", "").rstrip("/")
+    if not base:
+        return {"error": "Companion app not configured. Set companion_url in config.json."}, 400
+    try:
+        req = ureq.Request(
+            base + path,
+            data=body or None,
+            headers={"Content-Type": "application/json"} if body else {},
+            method=method,
+        )
+        with ureq.urlopen(req, timeout=30) as resp:
+            return json.loads(resp.read()), 200
+    except ureq.HTTPError as e:
+        try:
+            return json.loads(e.read()), e.code
+        except Exception:
+            return {"error": f"HTTP {e.code}"}, e.code
+    except Exception as e:
+        return {"error": str(e)}, 503
 
 
 # ─── In-memory job tracker ────────────────────────────────────────────────────
@@ -337,335 +362,26 @@ async def api_manifest_import(request):
 
 @routes.get("/runpod/aria2_check")
 async def api_aria2_check(request):
-    """Proxy-check if ARIA2 Downloader is running at localhost:7891."""
-    import urllib.request as ureq
-    try:
-        with ureq.urlopen("http://localhost:7891/api/runpod/status", timeout=3) as resp:
-            data = json.loads(resp.read())
-            return web.json_response({"available": True, "pod_status": data.get("status", "unknown")})
-    except Exception:
-        return web.json_response({"available": False})
+    data, status = _proxy_companion("/api/runpod/aria2_check", method="GET")
+    return web.json_response(data, status=status)
 
 
 @routes.post("/runpod/scan_ssh")
 async def api_scan_ssh(request):
-    """
-    Auto-scan the running RunPod worker via SSH.
-    1. Query RunPod GraphQL API for pods with SSH exposed
-    2. SSH in with ~/.runpod/ssh/runpodctl-ssh-key
-    3. List /workspace/custom_nodes and find model files
-    4. Save manifest_cache.json
-    """
-    import subprocess
-    import urllib.request as ureq
-
-    cfg = _load_config()
-    api_key = cfg.get("api_key", "")
-    if not api_key:
-        return web.json_response({"error": "API key non configurata"}, status=400)
-
-    # Query RunPod GraphQL for running pods with SSH
-    gql_query = json.dumps({
-        "query": "{ myself { pods { id name desiredStatus runtime { ports { ip isIpPublic privatePort publicPort type } } } } }"
-    }).encode()
-    gql_req = ureq.Request(
-        f"https://api.runpod.io/graphql?api_key={api_key}",
-        data=gql_query,
-        headers={"Content-Type": "application/json"},
-        method="POST"
-    )
-    try:
-        with ureq.urlopen(gql_req, timeout=15) as resp:
-            gql_data = json.loads(resp.read())
-    except Exception as e:
-        return web.json_response({"error": f"RunPod API error: {e}"}, status=500)
-
-    pods = gql_data.get("data", {}).get("myself", {}).get("pods", [])
-    ssh_info = None
-    for pod in pods:
-        if pod.get("desiredStatus") == "RUNNING" and pod.get("runtime"):
-            for port_info in pod["runtime"].get("ports", []):
-                if port_info.get("privatePort") == 22 and port_info.get("isIpPublic"):
-                    ssh_info = {
-                        "pod_id": pod["id"],
-                        "ip": port_info["ip"],
-                        "port": port_info["publicPort"],
-                    }
-                    break
-        if ssh_info:
-            break
-
-    if not ssh_info:
-        return web.json_response({
-            "error": "Nessun pod attivo con SSH trovato.",
-            "pods_found": len(pods),
-            "hint": "Avvia un pod con volume /workspace prima di scansionare.",
-        }, status=400)
-
-    # SSH and scan
-    ssh_key = str(Path.home() / ".runpod" / "ssh" / "runpodctl-ssh-key")
-    ssh_base = [
-        "ssh", "-i", ssh_key,
-        "-p", str(ssh_info["port"]),
-        "-o", "StrictHostKeyChecking=no",
-        "-o", "BatchMode=yes",
-        "-o", "ConnectTimeout=10",
-        f"root@{ssh_info['ip']}",
-    ]
-
-    def ssh_run(cmd):
-        result = subprocess.run(ssh_base + [cmd], capture_output=True, text=True, timeout=30)
-        return result.stdout.strip()
-
-    try:
-        custom_nodes_raw = ssh_run(
-            "ls /workspace/custom_nodes/ 2>/dev/null || ls /comfyui/custom_nodes/ 2>/dev/null"
-        )
-        models_raw = ssh_run(
-            r"find /workspace/models /comfyui/models 2>/dev/null"
-            r" \( -name '*.safetensors' -o -name '*.ckpt' -o -name '*.gguf' -o -name '*.pt' \)"
-            r" | sed 's|.*/models/||' | sort 2>/dev/null"
-        )
-    except subprocess.TimeoutExpired:
-        return web.json_response({"error": "Timeout SSH. Il pod risponde ma SSH è lento."}, status=500)
-    except Exception as e:
-        return web.json_response({"error": f"SSH error: {e}"}, status=500)
-
-    custom_nodes = [n for n in custom_nodes_raw.splitlines() if n and not n.startswith(".")]
-    models = [m for m in models_raw.splitlines() if m and not m.startswith("find:")]
-
-    # Check available disk space on /workspace
-    try:
-        disk_avail_raw = ssh_run(
-            "df -B1 /workspace 2>/dev/null | awk 'NR==2{print $4}' || echo 0"
-        )
-        disk_human_raw = ssh_run(
-            "df -h /workspace 2>/dev/null | awk 'NR==2{print $4}' || echo N/A"
-        )
-        disk_avail_bytes = int(disk_avail_raw.strip() or "0")
-        disk_human = disk_human_raw.strip() or "N/A"
-    except Exception:
-        disk_avail_bytes = 0
-        disk_human = "N/A"
-
-    manifest = {
-        "custom_nodes": sorted(set(custom_nodes)),
-        "models": sorted(set(models)),
-        "scanned_at": _now(),
-        "scan_method": "ssh",
-        "pod_id": ssh_info["pod_id"],
-        "pod_ip": ssh_info["ip"],
-        "disk": {
-            "available_bytes": disk_avail_bytes,
-            "available_human": disk_human,
-        },
-    }
-    save_manifest(manifest)
-
-    return web.json_response({
-        "ok": True,
-        "custom_nodes_count": len(manifest["custom_nodes"]),
-        "models_count": len(manifest["models"]),
-        "scanned_at": manifest["scanned_at"],
-        "pod_id": ssh_info["pod_id"],
-        "disk_available_human": disk_human,
-        "disk_available_bytes": disk_avail_bytes,
-    })
+    data, status = _proxy_companion("/api/runpod/scan_ssh", await request.read())
+    return web.json_response(data, status=status)
 
 
 @routes.post("/runpod/trigger_uploads")
 async def api_trigger_uploads(request):
-    """
-    Queue missing models and nodes in ARIA2 Downloader (localhost:7891).
-    Body: {"missing_models": [...], "missing_nodes": [...]}
-    Calls POST /api/runpod/upload for models, POST /api/runpod/node for nodes.
-    """
-    try:
-        data = await request.json()
-    except Exception:
-        return web.json_response({"error": "Invalid JSON"}, status=400)
-
-    missing_models = data.get("missing_models", [])
-    missing_nodes = data.get("missing_nodes", [])
-
-    ARIA2_BASE = "http://localhost:7891"
-    import urllib.request as ureq
-
-    # Check ARIA2 is reachable
-    try:
-        ureq.urlopen(ARIA2_BASE + "/api/runpod/status", timeout=4).read()
-    except Exception:
-        return web.json_response(
-            {"error": "ARIA2 Downloader non raggiungibile su porta 7891. Aprilo prima."},
-            status=400
-        )
-
-    # Locate local ComfyUI models directory
-    local_roots = [
-        Path("/Volumes/ComfyUI_6TB/ComfyUI/models"),
-        Path.home() / "ComfyUI" / "models",
-        Path("/workspace/ComfyUI/models"),
-    ]
-    local_models_root = next((r for r in local_roots if r.exists()), None)
-
-    # Known GitHub repos for custom nodes
-    NODE_GITHUB: dict[str, str] = {
-        "WanVideoWrapper":              "https://github.com/kijai/ComfyUI-WanVideoWrapper",
-        "ComfyUI-KJNodes":              "https://github.com/kijai/ComfyUI-KJNodes",
-        "ComfyUI-VideoHelperSuite":     "https://github.com/Kosinkadink/ComfyUI-VideoHelperSuite",
-        "ComfyUI-AnimateDiff-Evolved":  "https://github.com/Kosinkadink/ComfyUI-AnimateDiff-Evolved",
-        "ComfyUI-Impact-Pack":          "https://github.com/ltdrdata/ComfyUI-Impact-Pack",
-        "comfyui_controlnet_aux":       "https://github.com/Fannovel16/comfyui_controlnet_aux",
-        "ComfyUI-GGUF":                 "https://github.com/city96/ComfyUI-GGUF",
-        "ComfyUI-LTXVideo":             "https://github.com/Lightricks/ComfyUI-LTXVideo",
-        "ComfyUI-HunyuanVideoWrapper":  "https://github.com/kijai/ComfyUI-HunyuanVideoWrapper",
-        "ComfyUI-LTXVideo-Extra":       "https://github.com/ShmuelRonen/ComfyUI-LTXVideo-Extra",
-        "ComfyUI-WanVideoWrapper":      "https://github.com/kijai/ComfyUI-WanVideoWrapper",
-    }
-
-    def aria2_post(path, body):
-        payload = json.dumps(body).encode()
-        req = ureq.Request(
-            ARIA2_BASE + path, data=payload,
-            headers={"Content-Type": "application/json"}, method="POST"
-        )
-        with ureq.urlopen(req, timeout=15) as resp:
-            return json.loads(resp.read())
-
-    results: dict = {
-        "queued_models": [],
-        "queued_nodes": [],
-        "not_found_locally": [],
-        "unknown_node_repo": [],
-        "errors": [],
-    }
-
-    # Queue missing models
-    for model_rel in missing_models:
-        if not local_models_root:
-            results["not_found_locally"].append(model_rel)
-            continue
-        local_path = local_models_root / model_rel
-        if not local_path.exists():
-            results["not_found_locally"].append(model_rel)
-            continue
-        dest_subdir = str(Path(model_rel).parent)
-        if dest_subdir == ".":
-            dest_subdir = ""
-        try:
-            resp = aria2_post("/api/runpod/upload", {"path": str(local_path), "dest": dest_subdir})
-            results["queued_models"].append({"model": model_rel, "response": resp})
-        except Exception as e:
-            results["errors"].append({"item": model_rel, "error": str(e)})
-
-    # Queue missing custom nodes
-    for node in missing_nodes:
-        repo = NODE_GITHUB.get(node)
-        if not repo:
-            results["unknown_node_repo"].append(node)
-            continue
-        try:
-            resp = aria2_post("/api/runpod/node", {"repo": repo})
-            results["queued_nodes"].append({"node": node, "repo": repo, "response": resp})
-        except Exception as e:
-            results["errors"].append({"item": node, "error": str(e)})
-
-    # Add size info to response
-    total_queued_bytes = sum(
-        (local_models_root / m).stat().st_size
-        for m in missing_models
-        if local_models_root and (local_models_root / m).exists()
-    )
-    manifest_d = load_manifest()
-    disk_avail = (manifest_d or {}).get("disk", {}).get("available_bytes", 0)
-    space_warning = None
-    if disk_avail > 0 and total_queued_bytes > disk_avail * 0.85:
-        space_warning = (
-            f"Attenzione: stai caricando ~{_fmt_bytes(total_queued_bytes)} "
-            f"ma sul volume RunPod ci sono solo ~{_fmt_bytes(disk_avail)} disponibili. "
-            "Espandi il Network Volume su runpod.io prima di procedere."
-        )
-
-    results["ok"] = len(results["errors"]) == 0
-    results["total_queued"] = len(results["queued_models"]) + len(results["queued_nodes"])
-    results["estimated_upload_bytes"] = total_queued_bytes
-    results["estimated_upload_human"] = _fmt_bytes(total_queued_bytes) if total_queued_bytes else "0 B"
-    results["disk_available_bytes"] = disk_avail
-    results["space_warning"] = space_warning
-    return web.json_response(results)
+    data, status = _proxy_companion("/api/runpod/trigger_uploads", await request.read())
+    return web.json_response(data, status=status)
 
 
 @routes.post("/runpod/upload_plan")
 async def api_upload_plan(request):
-    """
-    Dry-run estimate: calculates local file sizes and checks RunPod disk space.
-    Body: {"missing_models": [...], "missing_nodes": [...]}
-    Returns size estimates and space warning WITHOUT queuing anything.
-    """
-    try:
-        data = await request.json()
-    except Exception:
-        return web.json_response({"error": "Invalid JSON"}, status=400)
-
-    missing_models = data.get("missing_models", [])
-    missing_nodes = data.get("missing_nodes", [])
-
-    local_roots = [
-        Path("/Volumes/ComfyUI_6TB/ComfyUI/models"),
-        Path.home() / "ComfyUI" / "models",
-        Path("/workspace/ComfyUI/models"),
-    ]
-    local_models_root = next((r for r in local_roots if r.exists()), None)
-
-    items = []
-    total_bytes = 0
-
-    for m in missing_models:
-        item: dict = {"type": "model", "name": m, "size_bytes": None, "found_locally": False}
-        if local_models_root:
-            lp = local_models_root / m
-            if lp.exists():
-                item["found_locally"] = True
-                item["size_bytes"] = lp.stat().st_size
-                total_bytes += item["size_bytes"]
-        items.append(item)
-
-    # Nodes: estimate 80 MB each (rough average for a custom node + deps)
-    _NODE_SIZE_ESTIMATE = 80 * 1024 * 1024
-    for n in missing_nodes:
-        items.append({
-            "type": "node", "name": n,
-            "size_bytes": _NODE_SIZE_ESTIMATE,
-            "found_locally": None,
-        })
-        total_bytes += _NODE_SIZE_ESTIMATE
-
-    manifest_d = load_manifest()
-    disk = (manifest_d or {}).get("disk", {})
-    disk_avail = disk.get("available_bytes", 0)
-    disk_human = disk.get("available_human", "N/A")
-
-    space_ok = (disk_avail == 0) or (total_bytes <= disk_avail * 0.85)
-    space_warning = None
-    if not space_ok:
-        space_warning = (
-            f"Spazio insufficiente: servono ~{_fmt_bytes(total_bytes)}, "
-            f"disponibili ~{_fmt_bytes(disk_avail)} su RunPod. "
-            "Espandi il Network Volume su runpod.io → My Pods → Edit Pod → Storage."
-        )
-
-    return web.json_response({
-        "items": items,
-        "total_bytes": total_bytes,
-        "total_human": _fmt_bytes(total_bytes) if total_bytes else "0 B",
-        "disk_available_bytes": disk_avail,
-        "disk_available_human": disk_human,
-        "space_ok": space_ok,
-        "space_warning": space_warning,
-        "models_count": len(missing_models),
-        "nodes_count": len(missing_nodes),
-        "manifest_age_warning": (manifest_d is None),
-    })
+    data, status = _proxy_companion("/api/runpod/upload_plan", await request.read())
+    return web.json_response(data, status=status)
 
 
 # ─── Register routes ──────────────────────────────────────────────────────────
